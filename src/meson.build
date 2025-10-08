@@ -18,6 +18,8 @@ livecaptions_sources = [
 
 cc = meson.get_compiler('c')
 
+curl_dep = dependency('libcurl', required: true)
+
 livecaptions_deps = [
   dependency('libadwaita-1', version: '>= 1.0'),
   #dependency('libpipewire-0.3', version: '>=0.3.41'),
@@ -25,7 +27,8 @@ livecaptions_deps = [
   dependency('x11'),
 
   cc.find_library('m', required: false),
-  april_lib
+  april_lib,
+  curl_dep
 ]
 
 gnome = import('gnome')
