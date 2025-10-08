@@ -17,6 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <curl/curl.h>
 #include <stdio.h>
 #include <errno.h>
 #include <signal.h>
@@ -35,28 +36,34 @@
 #include "profanity-filter.h"
 #include "common.h"
 
-void token_capitalizer_init(struct token_capitalizer *tc) {
+void token_capitalizer_init(struct token_capitalizer *tc)
+{
     tc->is_english = true;
     tc->previous_was_period = true;
     tc->finished_at_period = false;
     tc->force_next_cap = false;
 }
 
-bool token_capitalizer_next(struct token_capitalizer *tc, const char *token, int flags, const char *subsequent_token, int subsequent_flags) {
-    if((flags & APRIL_TOKEN_FLAG_SENTENCE_END_BIT) != 0){
+bool token_capitalizer_next(struct token_capitalizer *tc, const char *token, int flags, const char *subsequent_token, int subsequent_flags)
+{
+    if ((flags & APRIL_TOKEN_FLAG_SENTENCE_END_BIT) != 0)
+    {
         tc->previous_was_period = true;
         return false;
     }
 
-    if(tc->force_next_cap){
+    if (tc->force_next_cap)
+    {
         tc->force_next_cap = false;
         return true;
     }
 
-    if((tc->previous_was_period) && (flags & APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT)){
+    if ((tc->previous_was_period) && (flags & APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT))
+    {
         // If bare space token, capitalize the subsequent token since space can't
         // be capitalized.
-        if((token[0] == ' ') && (token[1] == 0)){
+        if ((token[0] == ' ') && (token[1] == 0))
+        {
             tc->force_next_cap = true;
         }
 
@@ -66,13 +73,19 @@ bool token_capitalizer_next(struct token_capitalizer *tc, const char *token, int
 
     // English-specific behavior: capitalize 'I'
     // TODO: A better way of capitalizing I and names and places
-    if(tc->is_english) {
-        if((token[0] == ' ') && (token[1] == 'I') && (token[2] == 0)){
-            if(subsequent_token != NULL){
-                if (((subsequent_flags & (APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT | APRIL_TOKEN_FLAG_SENTENCE_END_BIT)) != 0) || (subsequent_token[0] == '\'')){
+    if (tc->is_english)
+    {
+        if ((token[0] == ' ') && (token[1] == 'I') && (token[2] == 0))
+        {
+            if (subsequent_token != NULL)
+            {
+                if (((subsequent_flags & (APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT | APRIL_TOKEN_FLAG_SENTENCE_END_BIT)) != 0) || (subsequent_token[0] == '\''))
+                {
                     return true;
                 }
-            }else{
+            }
+            else
+            {
                 return true;
             }
         }
@@ -81,39 +94,45 @@ bool token_capitalizer_next(struct token_capitalizer *tc, const char *token, int
     return false;
 }
 
-void token_capitalizer_finish(struct token_capitalizer *tc){
+void token_capitalizer_finish(struct token_capitalizer *tc)
+{
     tc->finished_at_period = tc->previous_was_period;
     tc->previous_was_period = false;
     tc->force_next_cap = false;
 }
 
-void token_capitalizer_rewind(struct token_capitalizer *tc){
+void token_capitalizer_rewind(struct token_capitalizer *tc)
+{
     tc->previous_was_period = tc->finished_at_period;
     tc->force_next_cap = false;
 }
 
-
-#define REL_LINE_IDX(HEAD, IDX) (4*AC_LINE_COUNT + (HEAD) + (IDX)) % AC_LINE_COUNT
+#define REL_LINE_IDX(HEAD, IDX) (4 * AC_LINE_COUNT + (HEAD) + (IDX)) % AC_LINE_COUNT
 
 static GSettings *settings = NULL;
 
-void line_generator_init(struct line_generator *lg) {
-    for(int i=0; i<AC_LINE_COUNT; i++){
+void line_generator_init(struct line_generator *lg)
+{
+    for (int i = 0; i < AC_LINE_COUNT; i++)
+    {
         lg->active_start_of_lines[i] = -1;
 
         lg->lines[i].start_head = 0;
         lg->lines[i].start_len = 0;
+        lg->lines[i].translated[0] = '\0';
     }
 
     lg->current_line = 0;
     lg->active_start_of_lines[0] = 0;
 
-    if(settings == NULL) settings = g_settings_new("net.sapples.LiveCaptions");
+    if (settings == NULL)
+        settings = g_settings_new("net.sapples.LiveCaptions");
 
     token_capitalizer_init(&lg->tcap);
 }
 
-static int line_generator_get_text_width(struct line_generator *lg, const char *text){
+static int line_generator_get_text_width(struct line_generator *lg, const char *text)
+{
     pango_layout_set_width(lg->layout, -1);
 
     int width, height;
@@ -123,16 +142,113 @@ static int line_generator_get_text_width(struct line_generator *lg, const char *
     return width / PANGO_SCALE;
 }
 
+struct MemoryStruct
+{
+    char *memory;
+    size_t size;
+};
+
+// Callback für CURL, um Antwort zu sammeln
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+
+    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if (ptr == NULL)
+        return 0; // Out of memory
+
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+
+    return realsize;
+}
+
+char *translate_to_de(const char *text)
+{
+    CURL *curl;
+    CURLcode res;
+    struct MemoryStruct chunk = {0};
+
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    curl = curl_easy_init();
+
+    if (!curl)
+    {
+        fprintf(stderr, "Fehler: konnte CURL nicht initialisieren.\n");
+        return NULL;
+    }
+
+    // JSON-Body vorbereiten
+    char json_data[2048];
+    snprintf(json_data, sizeof(json_data), "{\"text\": \"%s\"}", text);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    char *TRANSLATE_URL = "http://localhost:8000/translate";
+    curl_easy_setopt(curl, CURLOPT_URL, TRANSLATE_URL);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+
+    res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+
+    if (res != CURLE_OK)
+    {
+        fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        free(chunk.memory);
+        return NULL;
+    }
+
+    // Übersetzten Text aus JSON holen: {"translated_text":"..."}
+    char *start = strstr(chunk.memory, "\"translated_text\":\"");
+    if (!start)
+    {
+        free(chunk.memory);
+        return NULL;
+    }
+    start += strlen("\"translated_text\":\"");
+    char *end = strchr(start, '"');
+    if (!end)
+    {
+        free(chunk.memory);
+        return NULL;
+    }
+
+    size_t len = end - start;
+    char *translated = malloc(len + 1);
+    strncpy(translated, start, len);
+    translated[len] = '\0';
+
+    free(chunk.memory);
+    return translated;
+}
+
 #define MAX_TOKEN_SCRATCH 72
-void line_generator_update(struct line_generator *lg, size_t num_tokens, const AprilToken *tokens) {
+void line_generator_update(struct line_generator *lg, size_t num_tokens, const AprilToken *tokens)
+{
     // Add capitalization information
     static bool should_capitalize[1024];
 
     token_capitalizer_rewind(&lg->tcap);
-    for(size_t i=0; i<num_tokens; i++){
-        if((i+1) < num_tokens) {
-            should_capitalize[i] = token_capitalizer_next(&lg->tcap, tokens[i].token, tokens[i].flags, tokens[i+1].token, tokens[i+1].flags);
-        }else{
+    for (size_t i = 0; i < num_tokens; i++)
+    {
+        if ((i + 1) < num_tokens)
+        {
+            should_capitalize[i] = token_capitalizer_next(&lg->tcap, tokens[i].token, tokens[i].flags, tokens[i + 1].token, tokens[i + 1].flags);
+        }
+        else
+        {
             should_capitalize[i] = token_capitalizer_next(&lg->tcap, tokens[i].token, tokens[i].flags, NULL, 0);
         }
     }
@@ -145,10 +261,12 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
     FilterMode filter_mode = filter_profanity ? FILTER_PROFANITY : (filter_slurs ? FILTER_SLURS : FILTER_NONE);
 
     bool use_lowercase = !g_settings_get_boolean(settings, "text-uppercase");
-    char token_scratch[MAX_TOKEN_SCRATCH] = { 0 };
+    char token_scratch[MAX_TOKEN_SCRATCH] = {0};
 
-    for(size_t i=0; i<AC_LINE_COUNT; i++){
-        if(lg->active_start_of_lines[i] == -1) continue;
+    for (size_t i = 0; i < AC_LINE_COUNT; i++)
+    {
+        if (lg->active_start_of_lines[i] == -1)
+            continue;
         size_t start_of_line = lg->active_start_of_lines[i];
 
         struct line *curr = &lg->lines[i];
@@ -158,57 +276,71 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
         curr->head = curr->start_head;
         curr->len = curr->start_len;
 
-        if(num_tokens == 0) continue;
+        if (num_tokens == 0)
+            continue;
 
-        if(start_of_line >= num_tokens) {
-            if(i == lg->current_line) {
+        if (start_of_line >= num_tokens)
+        {
+            if (i == lg->current_line)
+            {
                 // oops... turns out our text isn't long enough for the new line
                 // backtrack to the previous line
                 lg->active_start_of_lines[lg->current_line] = -1;
                 lg->current_line = REL_LINE_IDX(lg->current_line, -1);
                 return line_generator_update(lg, num_tokens, tokens);
-            } else {
+            }
+            else
+            {
                 continue;
             }
         }
 
-
         ssize_t end = lg->active_start_of_lines[REL_LINE_IDX(i, 1)];
-        if((end == -1) || (i == lg->current_line)) end = num_tokens;
+        if ((end == -1) || (i == lg->current_line))
+            end = num_tokens;
 
         // print line
-        for(size_t j=start_of_line; j<((size_t)end);) {
+        for (size_t j = start_of_line; j < ((size_t)end);)
+        {
             size_t skipahead = 1;
             const char *token = tokens[j].token;
 
             bool should_be_capitalized = should_capitalize[j];
 
-            if(use_lowercase){
+            if (use_lowercase)
+            {
                 char *out = token_scratch;
                 const char *p = tokens[j].token;
                 gunichar c;
-                while (*p) {
+                while (*p)
+                {
                     c = g_utf8_get_char_validated(p, -1);
-                    if(c == ((gunichar)-2)) {
+                    if (c == ((gunichar)-2))
+                    {
                         printf("gunichar -2 \n");
                         break;
-                    }else if(c == ((gunichar)-1)) {
+                    }
+                    else if (c == ((gunichar)-1))
+                    {
                         printf("gunichar -1 \n");
                         break;
                     }
 
                     c = g_unichar_tolower(c);
 
-                    if(should_be_capitalized){
+                    if (should_be_capitalized)
+                    {
                         gunichar c1 = g_unichar_toupper(c);
-                        if(c != c1){
+                        if (c != c1)
+                        {
                             c = c1;
                             should_be_capitalized = false;
                         }
                     }
 
                     out += g_unichar_to_utf8(c, out);
-                    if((out + 6) >= (token_scratch + MAX_TOKEN_SCRATCH)){
+                    if ((out + 6) >= (token_scratch + MAX_TOKEN_SCRATCH))
+                    {
                         printf("Unicode too big for token scratch!\n");
                         break;
                     }
@@ -222,9 +354,11 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
             }
 
             // filter current word, if applicable
-            if((filter_mode > FILTER_NONE) && (tokens[j].flags & APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT)) {
+            if ((filter_mode > FILTER_NONE) && (tokens[j].flags & APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT))
+            {
                 size_t skip = get_filter_skip(tokens, j, num_tokens, filter_mode);
-                if(skip > 0) {
+                if (skip > 0)
+                {
                     skipahead = skip;
                     token = SWEAR_REPLACEMENT;
                 }
@@ -232,22 +366,28 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
 
             // skip if line is too long to safely write
             bool must_break = (curr->head > (AC_LINE_MAX - 256));
-            if(must_break){
+            if (must_break)
+            {
                 printf("Must linebreak, but not active line. Leaving incomplete line...\n");
                 break;
             }
 
             // break line if too long
-            if(i == lg->current_line){
+            if (i == lg->current_line)
+            {
                 curr->len += line_generator_get_text_width(lg, token);
-                if(curr->len >= lg->max_text_width) {
+                if (curr->len >= lg->max_text_width)
+                {
                     size_t tgt_brk = j;
                     // find previous word boundary
-                    while((!(tokens[tgt_brk].flags & APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT)) && (tgt_brk > start_of_line)) tgt_brk--;
+                    while ((!(tokens[tgt_brk].flags & APRIL_TOKEN_FLAG_WORD_BOUNDARY_BIT)) && (tgt_brk > start_of_line))
+                        tgt_brk--;
 
                     // if we backtracked all the way to the start of line, just give up and break here
                     // unless this line has starting text
-                    if((tgt_brk == start_of_line) && (curr->start_head == 0)) tgt_brk = j;
+                    if ((tgt_brk == start_of_line) && (curr->start_head == 0))
+                        tgt_brk = j;
+                    
 
                     // line break
                     lg->current_line = REL_LINE_IDX(lg->current_line, 1);
@@ -262,14 +402,16 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
             int alpha = (int)((tokens[j].logprob + 2.0) / 8.0 * 65536.0);
             alpha /= 2.0;
             alpha += 32768;
-            if(alpha < 10000) alpha = 10000;
-            if(alpha > 65535) alpha = 65535;
+            if (alpha < 10000)
+                alpha = 10000;
+            if (alpha > 65535)
+                alpha = 65535;
 
-            if(use_fade)
+            if (use_fade)
                 curr->head += sprintf(&curr->text[curr->head], "<span fgalpha=\"%d\">%s</span>", alpha, token);
             else
                 curr->head += sprintf(&curr->text[curr->head], "%s", token);
-            
+
             g_assert(curr->head < AC_LINE_MAX);
 
             j += skipahead;
@@ -277,9 +419,11 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
     }
 }
 
-void line_generator_finalize(struct line_generator *lg) {
+void line_generator_finalize(struct line_generator *lg)
+{
     // reset active
-    for(size_t i=0; i<AC_LINE_COUNT; i++) lg->active_start_of_lines[i] = -1;
+    for (size_t i = 0; i < AC_LINE_COUNT; i++)
+        lg->active_start_of_lines[i] = -1;
 
     // freeze the current line thus far
     lg->lines[lg->current_line].start_head = lg->lines[lg->current_line].head;
@@ -291,12 +435,14 @@ void line_generator_finalize(struct line_generator *lg) {
     lg->active_start_of_lines[lg->current_line] = 0;
 }
 
-void line_generator_break(struct line_generator *lg) {
+void line_generator_break(struct line_generator *lg)
+{
     // insert new line
     lg->current_line = REL_LINE_IDX(lg->current_line, 1);
 
     // reset active
-    for(int i=0; i<AC_LINE_COUNT; i++) lg->active_start_of_lines[i] = -1;
+    for (int i = 0; i < AC_LINE_COUNT; i++)
+        lg->active_start_of_lines[i] = -1;
 
     // set new line to start at 0
     lg->active_start_of_lines[lg->current_line] = 0;
@@ -309,47 +455,75 @@ void line_generator_break(struct line_generator *lg) {
     lg->lines[lg->current_line].start_len = 0;
 }
 
-void line_generator_set_text(struct line_generator *lg, GtkLabel *lbl) {
+void line_generator_set_text(struct line_generator *lg, GtkLabel *lbl)
+{
     char *head = &lg->output[0];
     *head = '\0';
 
-    for(int i=AC_LINE_COUNT-1; i>=0; i--) {
+    for (int i = AC_LINE_COUNT - 1; i >= 0; i--)
+    {
         struct line *curr = &lg->lines[REL_LINE_IDX(lg->current_line, -i)];
-        head += sprintf(head, "%s", curr->text);
 
-        if(i != 0) head += sprintf(head, "\n");
+        if (i > 0) {
+            if (curr->text[0] != '\0' && curr->translated[0] == '\0') {
+                printf("Translating: %s\n", curr->text);
+                char *translated = translate_to_de(curr->text);
+                printf("Translated: %s\n", translated);
+                snprintf(curr->translated, AC_LINE_MAX, "%s", translated);
+            }
+            head += sprintf(head, "%s", curr->translated);
+        } else {
+            head += sprintf(head, "%s", curr->text);
+        }
+        
+        //printf("Setting: %d %s\n", i, curr->text);
+
+        if (i != 0)
+            head += sprintf(head, "\n");
     }
 
     gtk_label_set_markup(lbl, lg->output);
 }
 
-void line_generator_set_language(struct line_generator *lg, const char* language) {
+void line_generator_set_language(struct line_generator *lg, const char *language)
+{
     lg->is_english = (language[0] == 'e') && (language[1] == 'n');
     lg->tcap.is_english = lg->is_english;
 }
 
-const char *line_generator_get_plaintext(struct line_generator *lg) {
+const char *line_generator_get_plaintext(struct line_generator *lg)
+{
     bool use_fade = g_settings_get_boolean(settings, "fade-text");
 
     char *head = &lg->plaintext[0];
     *head = '\0';
 
-    for(int i=AC_LINE_COUNT-1; i>=0; i--) {
+    for (int i = AC_LINE_COUNT - 1; i >= 0; i--)
+    {
         struct line *curr = &lg->lines[REL_LINE_IDX(lg->current_line, -i)];
 
-        if(!use_fade) {
+        if (!use_fade)
+        {
             head += sprintf(head, "%s", curr->text);
-        } else {
+        }
+        else
+        {
             // HACK: We need to remove the <span...></span> tags
             bool inside_markup = false;
-            for(int j=0; j<curr->head; j++) {
-                if(curr->text[j] == '<') {
+            for (int j = 0; j < curr->head; j++)
+            {
+                if (curr->text[j] == '<')
+                {
                     inside_markup = true;
                     continue;
-                }else if(curr->text[j] == '>') {
+                }
+                else if (curr->text[j] == '>')
+                {
                     inside_markup = false;
                     continue;
-                }else if(inside_markup) {
+                }
+                else if (inside_markup)
+                {
                     continue;
                 }
 
@@ -357,7 +531,8 @@ const char *line_generator_get_plaintext(struct line_generator *lg) {
             }
         }
 
-        if(i != 0) head += sprintf(head, "\n");
+        if (i != 0)
+            head += sprintf(head, "\n");
     }
 
     return &lg->plaintext[0];
