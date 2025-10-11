@@ -387,8 +387,12 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
                     // unless this line has starting text
                     if ((tgt_brk == start_of_line) && (curr->start_head == 0))
                         tgt_brk = j;
-                    
 
+                    printf("Translating: %s\n", curr->text);
+                    char *translated = translate_to_de(curr->text);
+                    printf("Translated: %s\n", translated);
+                    snprintf(curr->translated, AC_LINE_MAX, "%s", translated);
+            
                     // line break
                     lg->current_line = REL_LINE_IDX(lg->current_line, 1);
                     lg->active_start_of_lines[lg->current_line] = tgt_brk;
@@ -399,16 +403,19 @@ void line_generator_update(struct line_generator *lg, size_t num_tokens, const A
             }
 
             // write the actual line
-            int alpha = (int)((tokens[j].logprob + 2.0) / 8.0 * 65536.0);
-            alpha /= 2.0;
-            alpha += 32768;
-            if (alpha < 10000)
-                alpha = 10000;
-            if (alpha > 65535)
-                alpha = 65535;
+            
 
-            if (use_fade)
+            if (use_fade) {
+                int alpha = (int)((tokens[j].logprob + 2.0) / 8.0 * 65536.0);
+                alpha /= 2.0;
+                alpha += 32768;
+                if (alpha < 10000)
+                    alpha = 10000;
+                if (alpha > 65535)
+                    alpha = 65535;
+                
                 curr->head += sprintf(&curr->text[curr->head], "<span fgalpha=\"%d\">%s</span>", alpha, token);
+            }
             else
                 curr->head += sprintf(&curr->text[curr->head], "%s", token);
 
@@ -465,12 +472,6 @@ void line_generator_set_text(struct line_generator *lg, GtkLabel *lbl)
         struct line *curr = &lg->lines[REL_LINE_IDX(lg->current_line, -i)];
 
         if (i > 0) {
-            if (curr->text[0] != '\0' && curr->translated[0] == '\0') {
-                printf("Translating: %s\n", curr->text);
-                char *translated = translate_to_de(curr->text);
-                printf("Translated: %s\n", translated);
-                snprintf(curr->translated, AC_LINE_MAX, "%s", translated);
-            }
             head += sprintf(head, "%s", curr->translated);
         } else {
             head += sprintf(head, "%s", curr->text);
